@@ -1,2 +1,0 @@
-# citius
-App de Corrida
