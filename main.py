@@ -24,7 +24,10 @@ ADMIN_PASS        = os.environ.get("ADMIN_PASS", "admin123")
 BASE_URL          = os.environ.get("BASE_URL", "https://SEU-DOMINIO.up.railway.app")
 AGENT_NAME        = os.environ.get("AGENT_NAME", "PrimeiraMente")
 AGENT_MODEL       = os.environ.get("AGENT_MODEL", "claude-haiku-4-5-20251001")
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
+GROQ_API_KEY           = os.environ.get("GROQ_API_KEY")
+STRAVA_CLIENT_ID       = os.environ.get("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET   = os.environ.get("STRAVA_CLIENT_SECRET")
+STRAVA_VERIFY_TOKEN    = os.environ.get("STRAVA_VERIFY_TOKEN", "citius_strava_verify")
 MP_ACCESS_TOKEN   = os.environ.get("MP_ACCESS_TOKEN")
 MP_PUBLIC_KEY     = os.environ.get("MP_PUBLIC_KEY")
 MP_PLAN_ID        = os.environ.get("MP_PLAN_ID", "bc34d81de9ba466b8d2693d1a134871c")
@@ -458,6 +461,7 @@ def base_html(titulo: str, conteudo: str, pagina_ativa: str = "") -> str:
         "consultas":   ("Consultas",   "/admin/consultas"),
         "prompt":      ("Prompt",      "/admin/prompt"),
         "arquivos":    ("Arquivos",    "/admin/arquivos"),
+        "strava":      ("Strava",      "/admin/strava"),
     }
     nav_html = ""
     for chave, (label, url) in nav.items():
@@ -1710,3 +1714,362 @@ async def webhook(request: Request):
     except Exception as e:
         print(f"ERRO webhook: {e}")
         return {"status": "erro", "detalhe": str(e)}
+
+# ============================================================
+# STRAVA — INTEGRACAO
+# ============================================================
+
+STRAVA_PREFIX = "strava:"
+
+def salvar_strava_tokens(telefone: str, dados: dict):
+    r.set(f"{STRAVA_PREFIX}{telefone}", json.dumps(dados))
+
+def obter_strava_tokens(telefone: str) -> dict | None:
+    dados = r.get(f"{STRAVA_PREFIX}{telefone}")
+    return json.loads(dados) if dados else None
+
+def obter_telefone_por_strava_id(athlete_id: int) -> str | None:
+    """Busca o telefone do usuario pelo athlete_id do Strava."""
+    chaves = r.keys(f"{STRAVA_PREFIX}*")
+    for chave in chaves:
+        dados = json.loads(r.get(chave) or "{}")
+        if dados.get("athlete_id") == athlete_id:
+            return chave.replace(STRAVA_PREFIX, "")
+    return None
+
+def listar_conexoes_strava() -> list:
+    chaves = r.keys(f"{STRAVA_PREFIX}*")
+    resultado = []
+    for chave in sorted(chaves):
+        dados = json.loads(r.get(chave) or "{}")
+        dados["telefone"] = chave.replace(STRAVA_PREFIX, "")
+        resultado.append(dados)
+    return resultado
+
+async def renovar_token_strava(telefone: str) -> str | None:
+    """Renova o access_token usando o refresh_token."""
+    dados = obter_strava_tokens(telefone)
+    if not dados:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(
+                "https://www.strava.com/oauth/token",
+                data={
+                    "client_id":     STRAVA_CLIENT_ID,
+                    "client_secret": STRAVA_CLIENT_SECRET,
+                    "grant_type":    "refresh_token",
+                    "refresh_token": dados.get("refresh_token"),
+                }
+            )
+            if resp.status_code == 200:
+                novo = resp.json()
+                dados["access_token"]  = novo["access_token"]
+                dados["refresh_token"] = novo["refresh_token"]
+                dados["expires_at"]    = novo["expires_at"]
+                salvar_strava_tokens(telefone, dados)
+                return novo["access_token"]
+    except Exception as e:
+        print(f"ERRO renovar token Strava: {e}")
+    return None
+
+async def obter_token_valido(telefone: str) -> str | None:
+    dados = obter_strava_tokens(telefone)
+    if not dados:
+        return None
+    import time
+    if dados.get("expires_at", 0) < time.time() + 300:
+        return await renovar_token_strava(telefone)
+    return dados.get("access_token")
+
+async def buscar_ultimo_treino_strava(telefone: str) -> dict | None:
+    """Busca a atividade mais recente do usuario no Strava."""
+    token = await obter_token_valido(telefone)
+    if not token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"per_page": 1, "page": 1}
+            )
+            if resp.status_code == 200:
+                atividades = resp.json()
+                if atividades:
+                    return atividades[0]
+    except Exception as e:
+        print(f"ERRO buscar atividade Strava: {e}")
+    return None
+
+def formatar_treino_para_claude(atividade: dict) -> str:
+    """Transforma os dados brutos do Strava em texto legivel para o Claude analisar."""
+    nome      = atividade.get("name", "Treino")
+    tipo      = atividade.get("type", "Run")
+    distancia = round(atividade.get("distance", 0) / 1000, 2)
+    duracao_s = atividade.get("moving_time", 0)
+    duracao_m = duracao_s // 60
+    fc_media  = atividade.get("average_heartrate")
+    fc_max    = atividade.get("max_heartrate")
+    pace_s    = (duracao_s / distancia / 1000) if distancia > 0 else 0
+    pace_min  = int(pace_s // 60)
+    pace_sec  = int(pace_s % 60)
+    elevacao  = atividade.get("total_elevation_gain", 0)
+    data      = atividade.get("start_date_local", "")[:10]
+    calorias  = atividade.get("calories")
+    cadencia  = atividade.get("average_cadence")
+
+    linhas = [
+        f"[Novo treino no Strava — {data}]",
+        f"Atividade: {nome} ({tipo})",
+        f"Distancia: {distancia} km",
+        f"Duracao: {duracao_m} min",
+        f"Pace medio: {pace_min}:{pace_sec:02d} /km" if distancia > 0 else "",
+        f"FC media: {fc_media} bpm" if fc_media else "",
+        f"FC maxima: {fc_max} bpm" if fc_max else "",
+        f"Desnivel: {elevacao} m" if elevacao else "",
+        f"Calorias: {calorias} kcal" if calorias else "",
+        f"Cadencia media: {cadencia} ppm" if cadencia else "",
+    ]
+    return "\n".join(l for l in linhas if l)
+
+
+# ============================================================
+# STRAVA — ROTAS OAuth
+# ============================================================
+
+@app.get("/strava/auth/{telefone}", response_class=HTMLResponse)
+async def strava_auth(telefone: str):
+    """Gera o link de autorizacao do Strava para o usuario conectar a conta."""
+    if not STRAVA_CLIENT_ID:
+        return HTMLResponse("<h2>STRAVA_CLIENT_ID nao configurado.</h2>", status_code=500)
+    scope    = "activity:read_all"
+    redirect = f"{BASE_URL}/strava/callback"
+    url = (
+        f"https://www.strava.com/oauth/authorize"
+        f"?client_id={STRAVA_CLIENT_ID}"
+        f"&redirect_uri={redirect}"
+        f"&response_type=code"
+        f"&approval_prompt=auto"
+        f"&scope={scope}"
+        f"&state={telefone}"
+    )
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conectar Strava — Citius</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: Arial, sans-serif; background: #f0f2f5; display: flex;
+                align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }}
+        .card {{ background: white; border-radius: 16px; padding: 40px; max-width: 440px;
+                 width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.10); text-align: center; }}
+        .emoji {{ font-size: 52px; margin-bottom: 16px; }}
+        h1 {{ font-size: 22px; color: #1a1a2e; margin-bottom: 10px; }}
+        p {{ font-size: 15px; color: #555; margin-bottom: 28px; line-height: 1.6; }}
+        .btn {{ display: block; background: #fc4c02; color: white; padding: 16px;
+                border-radius: 10px; font-size: 16px; font-weight: bold;
+                text-decoration: none; }}
+        .btn:hover {{ background: #e04302; }}
+        .seguro {{ font-size: 12px; color: #aaa; margin-top: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="emoji">🏃</div>
+        <h1>Conectar seu Strava</h1>
+        <p>Ao conectar, o Citius analisa seus treinos automaticamente e envia feedback personalizado no WhatsApp.</p>
+        <a href="{url}" class="btn">🔗 Conectar com Strava</a>
+        <p class="seguro">Lemos apenas seus treinos. Nunca postamos nada em seu nome.</p>
+    </div>
+</body>
+</html>""")
+
+
+@app.get("/strava/callback")
+async def strava_callback(code: str = "", state: str = "", error: str = ""):
+    """Recebe o codigo de autorizacao e troca pelo access_token."""
+    if error or not code:
+        return HTMLResponse("<h2>Autorizacao negada ou cancelada.</h2>")
+
+    telefone = state
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(
+                "https://www.strava.com/oauth/token",
+                data={
+                    "client_id":     STRAVA_CLIENT_ID,
+                    "client_secret": STRAVA_CLIENT_SECRET,
+                    "code":          code,
+                    "grant_type":    "authorization_code",
+                }
+            )
+            if resp.status_code != 200:
+                return HTMLResponse(f"<h2>Erro ao autenticar: {resp.text}</h2>")
+
+            dados_token = resp.json()
+            atleta      = dados_token.get("athlete", {})
+
+            salvar_strava_tokens(telefone, {
+                "access_token":  dados_token["access_token"],
+                "refresh_token": dados_token["refresh_token"],
+                "expires_at":    dados_token["expires_at"],
+                "athlete_id":    atleta.get("id"),
+                "athlete_name":  atleta.get("firstname", "") + " " + atleta.get("lastname", ""),
+                "conectado_em":  datetime.now().strftime("%d/%m/%Y %H:%M"),
+            })
+
+            print(f"STRAVA conectado: {telefone} — atleta {atleta.get('id')}")
+
+            # Avisa o usuario no WhatsApp
+            await enviar_whatsapp(
+                telefone,
+                f"✅ Strava conectado com sucesso, {atleta.get('firstname', '')}! "
+                "A partir de agora vou analisar seus treinos automaticamente e te dar feedback aqui no WhatsApp. 🏃"
+            )
+
+    except Exception as e:
+        print(f"ERRO strava_callback: {e}")
+        return HTMLResponse(f"<h2>Erro interno: {e}</h2>")
+
+    return HTMLResponse("""<!DOCTYPE html>
+<html lang="pt-br">
+<head><meta charset="UTF-8"><title>Strava Conectado</title>
+<style>body{{font-family:Arial,sans-serif;display:flex;align-items:center;
+justify-content:center;min-height:100vh;background:#f0f2f5;}}
+.card{{background:white;border-radius:16px;padding:40px;max-width:400px;
+text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.1);}}
+h1{{color:#16a34a;margin:16px 0 10px;}}p{{color:#555;font-size:15px;}}</style>
+</head><body><div class="card">
+<div style="font-size:52px">✅</div>
+<h1>Strava Conectado!</h1>
+<p>Pode fechar esta janela. O Citius vai te avisar no WhatsApp a cada treino concluido.</p>
+</div></body></html>""")
+
+
+# ============================================================
+# STRAVA — WEBHOOK (recebe notificacao de treino novo)
+# ============================================================
+
+@app.get("/strava/webhook")
+async def strava_webhook_verify(
+    hub_mode: str = "",
+    hub_challenge: str = "",
+    hub_verify_token: str = ""
+):
+    """Verificacao inicial do webhook pelo Strava."""
+    if hub_mode == "subscribe" and hub_verify_token == STRAVA_VERIFY_TOKEN:
+        return {"hub.challenge": hub_challenge}
+    raise HTTPException(status_code=403, detail="Token invalido")
+
+
+@app.post("/strava/webhook")
+async def strava_webhook_evento(request: Request):
+    """Recebe eventos do Strava (treino novo, atualizado, deletado)."""
+    try:
+        evento = await request.json()
+        print(f"STRAVA EVENTO: {evento}")
+
+        # So processa atividades novas do tipo criacao
+        if evento.get("object_type") != "activity" or evento.get("aspect_type") != "create":
+            return {"status": "ignorado"}
+
+        athlete_id  = evento.get("owner_id")
+        activity_id = evento.get("object_id")
+
+        telefone = obter_telefone_por_strava_id(athlete_id)
+        if not telefone:
+            print(f"Athlete {athlete_id} nao encontrado no Redis")
+            return {"status": "atleta nao encontrado"}
+
+        # Busca detalhes da atividade
+        token = await obter_token_valido(telefone)
+        if not token:
+            return {"status": "token invalido"}
+
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(
+                f"https://www.strava.com/api/v3/activities/{activity_id}",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            if resp.status_code != 200:
+                return {"status": "erro ao buscar atividade"}
+            atividade = resp.json()
+
+        # Monta mensagem de contexto para o Claude analisar
+        resumo_treino = formatar_treino_para_claude(atividade)
+        mensagem_interna = (
+            f"{resumo_treino}\n\n"
+            "Com base nesses dados do treino que o atleta acabou de concluir, "
+            "faca uma analise breve e motivadora. Comente o que foi bem, "
+            "destaque algum ponto de atencao se houver, e dê uma dica para o proximo treino. "
+            "Seja como um treinador real responderia — humano, direto e encorajador. "
+            "Maximo 4 parágrafos curtos, adequados para WhatsApp."
+        )
+
+        resposta = await chamar_claude(telefone, mensagem_interna)
+        await enviar_whatsapp(telefone, resposta)
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print(f"ERRO strava_webhook: {e}")
+        return {"status": "erro", "detalhe": str(e)}
+
+
+# ============================================================
+# STRAVA — PAINEL ADMIN
+# ============================================================
+
+@app.get("/admin/strava", response_class=HTMLResponse)
+def painel_strava(admin: str = Depends(verificar_admin)):
+    conexoes = listar_conexoes_strava()
+
+    rows = ""
+    for c in conexoes:
+        tel    = c.get("telefone", "")
+        nome   = c.get("athlete_name", "—")
+        data   = c.get("conectado_em", "—")
+        rows += f"""
+        <div class="aluno-row">
+            <div>
+                <div><strong>{tel}</strong> — {nome}</div>
+                <div class="aluno-info">Conectado em: {data}</div>
+            </div>
+            <a href="/admin/strava/desconectar/{tel}"
+               onclick="return confirm('Desconectar Strava de {tel}?')"
+               class="btn btn-danger">Desconectar</a>
+        </div>"""
+
+    if not rows:
+        rows = "<p style='color:#888;padding:12px 0'>Nenhum atleta conectou o Strava ainda.</p>"
+
+    verify_url = f"{BASE_URL}/strava/webhook"
+    conteudo = f"""
+    <div class="card">
+        <h2>Atletas com Strava Conectado ({len(conexoes)})</h2>
+        {rows}
+    </div>
+    <div class="card">
+        <h2>Configuracao do Webhook</h2>
+        <p style="font-size:13px;color:#555;margin-bottom:12px;">
+            Para ativar notificacoes automaticas de treinos, registre o webhook abaixo
+            no <a href="https://developers.strava.com" target="_blank">Strava API</a>.
+        </p>
+        <p style="font-size:13px;color:#888;">URL do Webhook:</p>
+        <code style="display:block;background:#f4f4f4;padding:10px;border-radius:8px;
+                     font-size:13px;margin:8px 0;">{verify_url}</code>
+        <p style="font-size:13px;color:#888;margin-top:12px;">Verify Token:</p>
+        <code style="display:block;background:#f4f4f4;padding:10px;border-radius:8px;
+                     font-size:13px;margin:8px 0;">{STRAVA_VERIFY_TOKEN}</code>
+    </div>"""
+
+    return HTMLResponse(base_html("Strava", conteudo, "strava"))
+
+
+@app.get("/admin/strava/desconectar/{telefone}")
+def desconectar_strava(telefone: str, admin: str = Depends(verificar_admin)):
+    r.delete(f"{STRAVA_PREFIX}{telefone}")
+    return RedirectResponse(url="/admin/strava")
