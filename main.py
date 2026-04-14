@@ -1954,13 +1954,13 @@ h1{{color:#16a34a;margin:16px 0 10px;}}p{{color:#555;font-size:15px;}}</style>
 # ============================================================
 
 @app.get("/strava/webhook")
-async def strava_webhook_verify(
-    hub_mode: str = "",
-    hub_challenge: str = "",
-    hub_verify_token: str = ""
-):
+async def strava_webhook_verify(request: Request):
     """Verificacao inicial do webhook pelo Strava."""
-    if hub_mode == "subscribe" and hub_verify_token == STRAVA_VERIFY_TOKEN:
+    params       = request.query_params
+    hub_mode     = params.get("hub.mode", "")
+    hub_challenge= params.get("hub.challenge", "")
+    hub_token    = params.get("hub.verify_token", "")
+    if hub_mode == "subscribe" and hub_token == STRAVA_VERIFY_TOKEN:
         return {"hub.challenge": hub_challenge}
     raise HTTPException(status_code=403, detail="Token invalido")
 
